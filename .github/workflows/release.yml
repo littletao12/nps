@@ -4,12 +4,6 @@ on:
   release:
     types: [published]
     branches: [ master ]
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version to build'
-        required: false
-        default: 'latest'
 
 jobs:
 
