@@ -1,5 +1,3 @@
-name: Release
-
 on:
   release:
     types: [published]
@@ -7,9 +5,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to build'
-        required: false
-        default: 'latest'
+        description: 'Version/tag to release (e.g. v1.0.0)'
+        required: true
+        default: 'v0.0.0-test'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -17,7 +15,6 @@ env:
 jobs:
 
   build_assets:
-    
     runs-on: ubuntu-latest
     steps:
 
@@ -26,8 +23,10 @@ jobs:
       with:
         go-version: 1.15
       id: go
+
     - name: Check out code into the Go module directory
       uses: actions/checkout@v4
+
     - name: Get dependencies
       run: |
         go get -v -t -d ./...
@@ -35,14 +34,29 @@ jobs:
             curl https://raw.githubusercontent.com/golang/dep/master/install.sh | sh
             dep ensure
         fi
+
     - name: Build
       run: |
         chmod +x build.assets.sh
         ./build.assets.sh
-    - name: Upload
+
+    # 手动触发时先创建 Release，再上传
+    - name: Create Release (workflow_dispatch only)
+      if: github.event_name == 'workflow_dispatch'
       uses: softprops/action-gh-release@v2
-      if: startsWith(github.ref, 'refs/tags/')
       with:
+        tag_name: ${{ github.event.inputs.version }}
+        name: ${{ github.event.inputs.version }}
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload
+      if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || '' }}
         files: |
           freebsd_386_client.tar.gz
           freebsd_386_server.tar.gz
@@ -79,65 +93,58 @@ jobs:
           npc_sdk.tar.gz
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        
+
   build_android:
-    
     runs-on: ubuntu-latest
     steps:
 
     - name: Check out code into the Go module directory
       uses: actions/checkout@v4
+
     - name: Build
       run: |
         chmod +x build.android.sh
         docker run --rm -i -w /app -v $(pwd):/app -e ANDROID_HOME=/usr/local/android_sdk -e GOPROXY=direct fyneio/fyne-cross:android-latest /app/build.android.sh
-    - name: Upload
+
+    - name: Create Release (workflow_dispatch only)
+      if: github.event_name == 'workflow_dispatch'
       uses: softprops/action-gh-release@v2
-      if: startsWith(github.ref, 'refs/tags/')
       with:
+        tag_name: ${{ github.event.inputs.version }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload
+      if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || '' }}
         files: |
           android_client.apk
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # build_spk:
-  #   
-  #   runs-on: ubuntu-latest
-  #   steps:
-
-  #   - name: Check out code into the Go module directory
-  #     uses: actions/checkout@v4
-  #   - name: Set env
-  #     run: echo "RELEASE_VERSION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
-  #   - name: Build
-  #     run: |
-  #       git clone https://github.com/cnlh/spksrc.git ~/spksrc
-  #       mkdir ~/spksrc/nps && cp -rf ./* ~/spksrc/nps/
-  #       docker run -id --name spksrc --env VERSION=${{ env.RELEASE_VERSION }} -e GOPROXY=direct -v ~/spksrc:/spksrc synocommunity/spksrc /bin/bash
-  #       docker exec spksrc /bin/bash -c 'cd /spksrc && make setup && cd /spksrc/spk/npc && make'
-  #       cp ~/spksrc/packages/npc_noarch-all_${{ env.RELEASE_VERSION }}-1.spk ./npc_syno.spk
-  #   - name: Upload
-  #     uses: softprops/action-gh-release@v2
-  #     if: startsWith(github.ref, 'refs/tags/')
-  #     with:
-  #       files: |
-  #         npc_syno.spk
-  #     env:
-  #       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
   build_docker:
-    
     runs-on: ubuntu-latest
     steps:
 
     - name: Check out code into the Go module directory
       uses: actions/checkout@v4
+
     - name: Set env
-      run: echo "RELEASE_VERSION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
+      run: |
+        if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          echo "RELEASE_VERSION=${{ github.event.inputs.version }}" >> $GITHUB_ENV
+        else
+          echo "RELEASE_VERSION=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
+        fi
+
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v3
+
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
+
     - name: Cache Docker layers
       uses: actions/cache@v4
       with:
@@ -145,11 +152,13 @@ jobs:
         key: ${{ runner.os }}-buildx-${{ github.sha }}
         restore-keys: |
           ${{ runner.os }}-buildx-
+
     - name: Login to DockerHub
-      uses: docker/login-action@v3 
+      uses: docker/login-action@v3
       with:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
+
     - name: Build and push nps
       uses: docker/build-push-action@v5
       with:
@@ -160,6 +169,7 @@ jobs:
         tags: |
           ${{ secrets.DOCKERHUB_USERNAME }}/nps:latest
           ${{ secrets.DOCKERHUB_USERNAME }}/nps:${{ env.RELEASE_VERSION }}
+
     - name: Build and push npc
       uses: docker/build-push-action@v5
       with:
