@@ -3,12 +3,10 @@ package client
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
 	"ehang.io/nps-mux"
 	"net"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -20,36 +18,6 @@ import (
 	"ehang.io/nps/lib/conn"
 	"ehang.io/nps/lib/crypt"
 )
-
-type DNSRecord struct {
-	ID         string    `json:"id"`
-	Name       string    `json:"name"`
-	Type       string    `json:"type"`
-	Content    string    `json:"content"`
-	Proxiable  bool      `json:"proxiable"`
-	Proxied    bool      `json:"proxied"`
-	TTL        int       `json:"ttl"`
-	Settings   struct{}  `json:"settings"`
-	Meta       struct{}  `json:"meta"`
-	Comment    *string   `json:"comment"`
-	Tags       []string  `json:"tags"`
-	CreatedOn  time.Time `json:"created_on"`
-	ModifiedOn time.Time `json:"modified_on"`
-}
-
-type DNSResponse struct {
-	Result     []DNSRecord `json:"result"`
-	Success    bool        `json:"success"`
-	Errors     []interface{} `json:"errors"`
-	Messages   []interface{} `json:"messages"`
-	ResultInfo struct {
-		Page       int `json:"page"`
-		PerPage    int `json:"per_page"`
-		Count      int `json:"count"`
-		TotalCount int `json:"total_count"`
-		TotalPages int `json:"total_pages"`
-	} `json:"result_info"`
-}
 
 type TRPClient struct {
 	svrAddr        string
@@ -63,14 +31,12 @@ type TRPClient struct {
 	cnf            *config.Config
 	disconnectTime int
 	once           sync.Once
-	originalSvrAddr string // 原始服务器地址，用于DNS解析
 }
 
 //new client
 func NewRPClient(svraddr string, vKey string, bridgeConnType string, proxyUrl string, cnf *config.Config, disconnectTime int) *TRPClient {
 	return &TRPClient{
 		svrAddr:        svraddr,
-		originalSvrAddr: svraddr,
 		p2pAddr:        make(map[string]string, 0),
 		vKey:           vKey,
 		bridgeConnType: bridgeConnType,
@@ -81,96 +47,28 @@ func NewRPClient(svraddr string, vKey string, bridgeConnType string, proxyUrl st
 	}
 }
 
-// resolveDNS resolves the DNS for pvpv domains using the API
-func (s *TRPClient) resolveDNS() (string, error) {
-	// Check if the server address contains pvpv.bid
-	if !strings.Contains(s.originalSvrAddr, "pvpv.bid") {
-		return s.originalSvrAddr, nil
-	}
-
-	// Extract the domain name from the server address
-	host := strings.Split(s.originalSvrAddr, ":")[0]
-
-	// Build the API URL
-	apiUrl := "https://cf-dns-manage.pvdddsscccddseeepv.bid/api/zones/6e4fd48d6b9eecef05e47dba5a443926/dns-records/search?name=" + host + "&type=AAAA&key=4ztk3rwt12233vzwu0ljrhib5ub"
-
-	// Make the API request
-	resp, err := http.Get(apiUrl)
-	if err != nil {
-		logs.Error("DNS resolution API request failed: %v", err)
-		return s.originalSvrAddr, err
-	}
-	defer resp.Body.Close()
-
-	// Parse the response
-	var dnsResp DNSResponse
-	if err := json.NewDecoder(resp.Body).Decode(&dnsResp); err != nil {
-		logs.Error("Failed to parse DNS response: %v", err)
-		return s.originalSvrAddr, err
-	}
-
-	// Check if the request was successful
-	if !dnsResp.Success || len(dnsResp.Result) == 0 {
-		logs.Error("DNS resolution failed: no records found")
-		return s.originalSvrAddr, nil
-	}
-
-	// Get the IP address from the first record
-	ip := dnsResp.Result[0].Content
-	port := strings.Split(s.originalSvrAddr, ":")[1]
-	resolvedAddr := ip + ":" + port
-
-	logs.Info("DNS resolved for %s: %s", s.originalSvrAddr, resolvedAddr)
-	return resolvedAddr, nil
-}
-
 var NowStatus int
 var CloseClient bool
 
 //start
 func (s *TRPClient) Start() {
 	CloseClient = false
-	useResolvedIP := false // 标记是否使用解析的IP
 retry:
 	if CloseClient {
 		return
 	}
 	NowStatus = 0
-	
-	var targetAddr string
-	if useResolvedIP {
-		// 使用API解析的IP
-		resolvedAddr, err := s.resolveDNS()
-		if err != nil {
-			logs.Warn("DNS resolution error, falling back to original address: %v", err)
-			targetAddr = s.originalSvrAddr
-		} else {
-			targetAddr = resolvedAddr
-			logs.Info("Attempting to connect using resolved IP: %s", targetAddr)
-		}
-	} else {
-		// 使用原始域名
-		targetAddr = s.originalSvrAddr
-		logs.Info("Attempting to connect using original domain: %s", targetAddr)
-	}
-	
-	c, err := NewConn(s.bridgeConnType, s.vKey, targetAddr, common.WORK_MAIN, s.proxyUrl)
+	c, err := NewConn(s.bridgeConnType, s.vKey, s.svrAddr, common.WORK_MAIN, s.proxyUrl)
 	if err != nil {
-		logs.Error("Connection failed, will reconnect in five seconds: %v", err)
-		// 切换连接方式
-		useResolvedIP = !useResolvedIP
+		logs.Error("The connection server failed and will be reconnected in five seconds, error", err.Error())
 		time.Sleep(time.Second * 5)
 		goto retry
 	}
 	if c == nil {
-		logs.Error("Error data from server, will reconnect in five seconds")
-		// 切换连接方式
-		useResolvedIP = !useResolvedIP
+		logs.Error("Error data from server, and will be reconnected in five seconds")
 		time.Sleep(time.Second * 5)
 		goto retry
 	}
-	
-	s.svrAddr = targetAddr
 	logs.Info("Successful connection with server %s", s.svrAddr)
 	//monitor the connection
 	go s.ping()
@@ -255,19 +153,9 @@ func (s *TRPClient) newUdpConn(localAddr, rAddr string, md5Password string) {
 
 //pmux tunnel
 func (s *TRPClient) newChan() {
-	// 独立解析DNS，保持与原有功能一致
-	resolvedAddr, err := s.resolveDNS()
+	tunnel, err := NewConn(s.bridgeConnType, s.vKey, s.svrAddr, common.WORK_CHAN, s.proxyUrl)
 	if err != nil {
-		logs.Warn("DNS resolution error in newChan, using current address: %v", err)
-		// 使用当前服务器地址作为备选
-		resolvedAddr = s.svrAddr
-	} else {
-		logs.Info("Using resolved IP for channel connection: %s", resolvedAddr)
-	}
-	
-	tunnel, err := NewConn(s.bridgeConnType, s.vKey, resolvedAddr, common.WORK_CHAN, s.proxyUrl)
-	if err != nil {
-		logs.Error("connect to ", resolvedAddr, "error:", err)
+		logs.Error("connect to ", s.svrAddr, "error:", err)
 		return
 	}
 	s.tunnel = nps_mux.NewMux(tunnel.Conn, s.bridgeConnType, s.disconnectTime)
